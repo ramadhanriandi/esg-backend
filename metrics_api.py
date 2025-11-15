@@ -1,19 +1,19 @@
 import os, json, time, hmac, base64, hashlib, logging, uuid, secrets
-from urllib.parse import parse_qs
-
-import boto3
-from botocore.exceptions import ClientError
+import boto3, os
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 rds = boto3.client("rds-data")
 secretsmgr = boto3.client("secretsmanager")
+ses = boto3.client("sesv2", region_name=os.environ.get("SES_REGION", "ap-southeast-1"))
 
 DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
 DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
 DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET_ARN = os.environ["JWT_SECRET_ARN"]
+SENDER = os.environ.get("ALERT_EMAIL_SENDER")
+RECEIVER = os.environ.get("ALERT_EMAIL_RECEIVER")
 
 CORS = {
     "Access-Control-Allow-Origin": "*",
@@ -162,46 +162,99 @@ def _compare(comparator: str, observed: float, threshold: float) -> bool:
     if comparator == ">":  return observed >  threshold
     return observed <= threshold
 
-def _open_or_update_alert(company_id, site_id, framework_code, indicator, new_sev, comparator, thr_val, observed):
-    out = exec_sql(
-        "SELECT alert_id, severity FROM alerts WHERE company_id=:cid AND site_id=:sid "
-        "AND framework_code=:fw AND indicator=:ind AND status='OPEN' LIMIT 1",
-        {"cid": company_id, "sid": site_id, "fw": framework_code, "ind": indicator}
+def _get_company_user_email(company_id: str) -> str | None:
+    out = exec_sql("SELECT email FROM users WHERE company_id=:cid LIMIT 1", {"cid": company_id})
+    recs = out.get("records") or []
+    return _cell_value(recs[0][0]) if recs else None
+
+def _get_site_name(site_id: str) -> str:
+    out = exec_sql("SELECT name FROM sites WHERE site_id=:sid LIMIT 1", {"sid": site_id})
+    recs = out.get("records") or []
+    return _cell_value(recs[0][0]) if recs else site_id
+
+def _send_alert_email(to_email: str, subject: str, html: str, text: str):
+    if not (to_email and SENDER): 
+        return
+    to_email = RECEIVER # override to fixed receiver for testing
+    ses.send_email(
+        FromEmailAddress=SENDER,
+        Destination={"ToAddresses": [to_email]},
+        Content={
+            "Simple": {
+                "Subject": {"Data": subject},
+                "Body": {
+                    "Text": {"Data": text},
+                    "Html": {"Data": html}
+                }
+            }
+        }
     )
-    rec = (out.get("records") or [None])[0]
-    if new_sev is None:
+    logger.info(json.dumps({"msg":"send_alert_email", "sender": SENDER, "receiver": to_email}))
+
+def _open_or_update_alert(company_id, site_id, framework_code, indicator, new_sev, comp, thr_val, observed):
+    rec = exec_sql(
+        "SELECT alert_id, severity FROM alerts "
+        "WHERE company_id=:cid AND site_id=:sid AND framework_code=:fw AND indicator=:ind AND status='OPEN' "
+        "LIMIT 1",
+        {"cid": company_id, "sid": site_id, "fw": framework_code, "ind": indicator}
+    ).get("records", [])
+
+    prev_sev = _cell_value(rec[0][1]) if rec else None
+    action = None  # "OPENED" | "ESCALATED" | "RESOLVED" | None
+
+    # Decide action & write
+    if new_sev:  # we have a breach
+        if not rec:
+            # INSERT OPEN
+            exec_sql(
+                "INSERT INTO alerts(alert_id,company_id,site_id,framework_code,indicator,severity,comparator,threshold_value,observed_value,status,raised_at) "
+                "VALUES (:aid,:cid,:sid,:fw,:ind,:sev,:cmp,:thr,:obs,'OPEN',now())",
+                {"aid": str(uuid.uuid4()), "cid": company_id, "sid": site_id, "fw": framework_code,
+                 "ind": indicator, "sev": new_sev, "cmp": comp, "thr": float(thr_val), "obs": float(observed)}
+            )
+            action = "OPENED"
+        else:
+            # UPDATE existing; detect escalation (WARN -> CRIT)
+            if prev_sev != new_sev:
+                action = "ESCALATED" if (prev_sev == "WARN" and new_sev == "CRIT") else None
+            exec_sql(
+                "UPDATE alerts SET severity=:sev, comparator=:cmp, threshold_value=:thr, observed_value=:obs "
+                "WHERE alert_id=:aid",
+                {"sev": new_sev, "cmp": comp, "thr": float(thr_val), "obs": float(observed),
+                 "aid": _cell_value(rec[0][0])}
+            )
+    else:
+        # No breach -> close if open
         if rec:
-            aid = _cell_value(rec[0])
-            exec_sql("UPDATE alerts SET status='CLEARED', cleared_at=now() WHERE alert_id=:aid", {"aid": aid})
-        return {"status": "CLEARED"}
+            exec_sql("UPDATE alerts SET status='CLEARED', cleared_at=now() WHERE alert_id=:aid",
+                     {"aid": _cell_value(rec[0][0])})
+            action = "RESOLVED"
 
-    if not rec:
-        exec_sql(
-            "INSERT INTO alerts(alert_id,company_id,site_id,framework_code,indicator,severity,comparator,threshold_value,observed_value,status) "
-            "VALUES (:aid,:cid,:sid,:fw,:ind,:sev,:cmp,:thr,:obs,'OPEN')",
-            {"aid": str(uuid.uuid4()), "cid": company_id, "sid": site_id, "fw": framework_code,
-             "ind": indicator, "sev": new_sev, "cmp": comparator, "thr": float(thr_val), "obs": float(observed)}
+    # Send e-mail if there was a notable transition
+    if action in ("OPENED", "ESCALATED", "RESOLVED"):
+        to_email = _get_company_user_email(company_id)
+        site_name = _get_site_name(site_id)
+        subj = f"[EcoTrack] {action}: {indicator} @ {site_name} ({framework_code})"
+        text = (
+            f"Action: {action}\n"
+            f"Indicator: {indicator}\n"
+            f"Framework: {framework_code}\n"
+            f"Site: {site_name}\n"
+            f"Observed: {observed}\n"
+            f"Threshold: {comp} {thr_val}\n"
         )
-        logger.info(json.dumps({"msg":"alert_opened","framework":framework_code,
-                                "indicator":indicator,"severity":new_sev,
-                                "observed": observed, "threshold": thr_val}))
-        return {"status": "OPEN", "severity": new_sev}
-
-    current_sev = _cell_value(rec[1])
-    aid = _cell_value(rec[0])
-    if current_sev == "CRIT":
-        exec_sql("UPDATE alerts SET observed_value=:obs, threshold_value=:thr WHERE alert_id=:aid",
-                 {"aid": aid, "obs": float(observed), "thr": float(thr_val)})
-        return {"status": "OPEN", "severity": "CRIT"}
-
-    if new_sev == "CRIT" and current_sev == "WARN":
-        exec_sql("UPDATE alerts SET severity='CRIT', observed_value=:obs, threshold_value=:thr WHERE alert_id=:aid",
-                 {"aid": aid, "obs": float(observed), "thr": float(thr_val)})
-        return {"status": "OPEN", "severity": "CRIT"}
-
-    exec_sql("UPDATE alerts SET observed_value=:obs, threshold_value=:thr WHERE alert_id=:aid",
-             {"aid": aid, "obs": float(observed), "thr": float(thr_val)})
-    return {"status": "OPEN", "severity": "WARN"}
+        html = f"""
+        <h3>EcoTrack Alert: {action}</h3>
+        <p><b>Indicator:</b> {indicator}<br/>
+           <b>Framework:</b> {framework_code}<br/>
+           <b>Site:</b> {site_name}<br/>
+           <b>Observed:</b> {observed} &nbsp;&nbsp; <b>Threshold:</b> {comp} {thr_val}</p>
+        <p>This message was generated automatically by EcoTrack.</p>
+        """
+        try:
+            _send_alert_email(to_email, subj, html, text)
+        except Exception:
+            logger.exception("alert_email_send_failed")
 
 def _evaluate_one(company_id, site_id, indicator, observed, it_load_pct):
     out_fw = exec_sql(

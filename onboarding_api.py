@@ -1,6 +1,5 @@
-import os, json, time, hmac, base64, hashlib, secrets, uuid
+import os, json, time, hmac, base64, hashlib, logging, uuid, secrets
 import boto3
-import logging
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -9,8 +8,8 @@ rds = boto3.client("rds-data")
 secretsmgr = boto3.client("secretsmanager")
 
 DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
-DB_SECRET_ARN  = os.environ["DB_SECRET_ARN"]
-DB_NAME        = os.environ["DB_NAME"]
+DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
+DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET_ARN = os.environ["JWT_SECRET_ARN"]
 
 CORS = {
