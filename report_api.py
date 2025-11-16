@@ -1,6 +1,6 @@
 import os, json, time, hmac, base64, hashlib, logging, uuid, io, csv
-from datetime import datetime, timezone
 from urllib.parse import parse_qs
+from datetime import datetime, timezone
 
 import boto3
 
@@ -128,18 +128,6 @@ def _nearest_nominal_band(it_pct):
     if it < 87.5: return 75
     return 100
 
-def _nearest_defined_pue_band(company_id, site_id, framework_code, requested_band: int) -> int | None:
-    out = exec_sql(
-        "SELECT DISTINCT load_band FROM thresholds "
-        "WHERE company_id=:cid AND site_id=:sid AND framework_code=:fw "
-        "AND indicator='PUE' AND load_band IS NOT NULL",
-        {"cid": company_id, "sid": site_id, "fw": framework_code}
-    )
-    bands = [_cell_value(r[0]) for r in (out.get("records") or [])]
-    if not bands:
-        return None
-    return min(bands, key=lambda b: abs(int(b) - int(requested_band)))
-
 def _compare(comp: str, obs: float, thr: float) -> bool:
     if comp == "<=": return obs <= thr
     if comp == "<":  return obs <  thr
@@ -207,8 +195,9 @@ def _compute_summary(company_id, site_id, framework_code, ts_from_iso, ts_to_iso
     th = _get_thresholds(company_id, site_id, framework_code)
     metrics = _get_metrics(company_id, site_id, ts_from_iso, ts_to_iso)
 
+    site_meta = _get_site_meta(site_id)
     out = {
-        "site_id": site_id,
+        "site": site_meta,
         "framework_code": framework_code,
         "period": {"from": ts_from_iso, "to": ts_to_iso},
         "indicators": {
@@ -266,10 +255,13 @@ def _compute_summary(company_id, site_id, framework_code, ts_from_iso, ts_to_iso
 def _summary_to_csv(summary: dict) -> bytes:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["site_id", summary["site_id"]])
+    site = summary.get("site", {}) or {}
+    w.writerow(["site_name", site.get("name", "")])
+    w.writerow(["timezone", site.get("timezone", "")])
+    w.writerow(["country", site.get("country", "")])
     w.writerow(["framework_code", summary["framework_code"]])
     w.writerow(["from", summary["period"]["from"]])
-    w.writerow(["to",   summary["period"]["to"]])
+    w.writerow(["to", summary["period"]["to"]])
     w.writerow([])
     w.writerow(["indicator","samples","ok","warn","crit","ok_pct","warn_pct","crit_pct","avg","min","max"])
     for ind, d in summary["indicators"].items():
@@ -277,6 +269,29 @@ def _summary_to_csv(summary: dict) -> bytes:
                     d.get("ok_pct",0.0), d.get("warn_pct",0.0), d.get("crit_pct",0.0),
                     d["avg"], d["min"], d["max"]])
     return buf.getvalue().encode()
+
+def _slug(s: str) -> str:
+    s = (s or "").lower()
+    out = []
+    for ch in s:
+        if ch.isalnum(): out.append(ch)
+        elif ch in (" ", "-", "_", "."): out.append("-")
+    slug = "".join(out).strip("-")
+    while "--" in slug: slug = slug.replace("--", "-")
+    return slug or "site"
+
+def _get_site_meta(site_id: str) -> dict:
+    out = exec_sql(
+        "SELECT name, timezone, country FROM sites WHERE site_id=:sid LIMIT 1",
+        {"sid": site_id}
+    ).get("records", [])
+    if out:
+        name = _cell_value(out[0][0]) or site_id
+        tz   = _cell_value(out[0][1]) or "UTC"
+        ctry = _cell_value(out[0][2]) or "Unknown"
+        return {"name": name, "timezone": tz, "country": ctry}
+
+    return {"name": site_id, "timezone": "UTC", "country": "Unknown"}
 
 def post_reports(event, claims):
     body = json.loads(event.get("body") or "{}")
@@ -296,20 +311,46 @@ def post_reports(event, claims):
 
     s = _compute_summary(claims["company_id"], site_id, framework_code, ts_from, ts_to)
 
-    rid = str(uuid.uuid4())
-    base_key = f"reports/{site_id}/{framework_code}/{rid}"
+    site_row = exec_sql("SELECT name FROM sites WHERE site_id=:sid LIMIT 1", {"sid": site_id}).get("records") or []
+    site_name = _cell_value(site_row[0][0]) if site_row else site_id
+
+    def _parse_iso(ts):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            return datetime.strptime(ts, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+    dt_from = _parse_iso(ts_from)
+    dt_to = _parse_iso(ts_to)
+    from_str = dt_from.strftime("%Y-%m-%d")
+    to_str = dt_to.strftime("%Y-%m-%d")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    title = f"EcoTrack Report — {site_name} — {framework_code} — {from_str} to {to_str}"
+
+    base_prefix = f"reports/{site_id}/{framework_code}/"
+    filename_no_ext = f"ecotrack_report_{_slug(site_name)}_{framework_code}_{from_str}_to_{to_str}_{stamp}"
     if fmt == "csv":
         body_bytes = _summary_to_csv(s)
-        key = base_key + ".csv"
+        key = base_prefix + filename_no_ext + ".csv"
         s3.put_object(Bucket=S3_REPORTS_BUCKET, Key=key, Body=body_bytes, ContentType="text/csv")
+        filename = filename_no_ext + ".csv"
     else:
-        key = base_key + ".json"
+        key = base_prefix + filename_no_ext + ".json"
         s3.put_object(Bucket=S3_REPORTS_BUCKET, Key=key, Body=json.dumps(s).encode(), ContentType="application/json")
+        filename = filename_no_ext + ".json"
 
     url = s3.generate_presigned_url(
         ClientMethod="get_object", Params={"Bucket": S3_REPORTS_BUCKET, "Key": key}, ExpiresIn=3600
     )
-    return resp(201, {"report_id": rid, "download_url": url, "s3_key": key, "format": fmt})
+    return resp(201, {
+        "report_id": str(uuid.uuid4()),   # keep a traceable id if you still want one
+        "title": title,
+        "filename": filename,
+        "s3_key": key,
+        "format": fmt,
+        "download_url": url
+    })
 
 def get_reports_summary(event, claims):
     qs = parse_qs(event.get("rawQueryString") or "")
