@@ -165,7 +165,7 @@ We use UUID PKs everywhere; timestamps are `timestamptz.` Below is a concise vie
   - `POST /metrics` (API token) — ingest & evaluate.
 - **IAM:** `rds-data:*`, `secretsmanager:GetSecretValue`, CloudWatch Logs, `ses:SendEmail`.
 
-### Reports (J4) — `report_api.py`
+### 7.4. Reports (J4) — `report_api.py`
 - **Routes:**
   - `POST /reports` (JWT) — build report, upload to S3, return presigned URL + title/filename.
   - `GET /reports/summary` (JWT) — inline KPIs JSON.
